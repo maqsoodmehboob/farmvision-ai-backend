@@ -504,7 +504,7 @@ async def predict(
             # Uncertain result
             if disease == "Uncertain - Please retake photo":
                 return {
-                    "crop":             crop,
+                    "crop":             "Unknown",
                     "disease":          "Uncertain",
                     "confidence":       conf,
                     "cause":            "Image is not clear enough for accurate detection.",
