@@ -55,7 +55,7 @@ MODEL_DIR = "models"
 IMG_SIZE  = (224, 224)
 
 # Confidence thresholds
-CROP_CONF_THRESHOLD    = 0.75   # Crop classifier min confidence
+CROP_CONF_THRESHOLD    = 0.70   # Crop classifier min confidence
 DISEASE_CONF_THRESHOLD = 0.65   # Disease model min confidence
 
 # ============================================================
