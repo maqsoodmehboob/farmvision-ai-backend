@@ -1,3 +1,23 @@
+# ==============================================================
+# train_model.py — Farm Vision CNN Training
+#
+# Dataset Structure (aapke paas jo hai):
+# datasets/
+# ├── Potato/
+# │   ├── Training/        → Early_Blight, Late_Blight, Healthy
+# │   └── Validation/      → Early_Blight, Late_Blight, Healthy
+# ├── Tomato Diseases in Pakistan/
+# │   ├── train/           → Early_blight, Late_blight, Leaf_Mold,
+# │   │                       powdery_mildew, Tomato_mosaic_virus, healthy
+# │   └── valid/
+# ├── Cucumber/
+# │   └── (direct classes) → Anthracnose lesions, Downy mildew, Fresh leaf
+# └── Cauliflower/
+#     └── (direct classes) → Black Rot, Downy mildew, Fresh leaf
+#
+# Run: python train_model.py
+# ==============================================================
+
 import os
 import json
 import numpy as np
@@ -6,6 +26,7 @@ from tensorflow.keras import layers, models
 from tensorflow.keras.applications import MobileNetV2
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
+from sklearn.utils.class_weight import compute_class_weight
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -52,6 +73,31 @@ CROP_CONFIG = {
         "mode":         "auto",   # classes directly hain
     },
 }
+
+# ============================================================
+# CROP CLASSIFIER CONFIG
+# This is the FIRST model that runs in main.py — it decides which
+# of the 4 crops an image belongs to, BEFORE any disease model runs.
+# This is the model responsible for the "mango/human → Tomato" bug,
+# because it was likely trained on an imbalanced set of healthy leaf
+# images (Tomato heavily over-represented vs the other 3 crops).
+#
+# Expected folder structure:
+#   datasets/CropClassifier/
+#     ├── Tomato/        (healthy leaf images)
+#     ├── Potato/
+#     ├── Cucumber/
+#     └── Cauliflower/
+#
+# IMPORTANT — to actually solve OOD rejection (mango/human entirely
+# outside these 4 classes), add a 5th folder here named "Other"
+# containing diverse non-target leaves (mango, neem, guava, wheat,
+# random houseplants — 300-500 images each, 6-8 species). This script
+# will automatically pick it up and train a 5-class model instead of 4.
+# This is the Phase 2 fix discussed earlier — not required to run
+# today's class-weighting fix, but strongly recommended next.
+# ============================================================
+CROP_CLASSIFIER_FOLDER = "CropClassifier"
 
 # ============================================================
 # DISEASE NAME MAPPING
@@ -167,6 +213,44 @@ def create_generators_auto(crop_path):
     return train_gen, val_gen
 
 # ============================================================
+# CLASS WEIGHTING — Fixes class imbalance bias
+#
+# Root cause this addresses: when one class (e.g. Tomato disease
+# classes, or one disease within a crop) has far more training
+# images than others, the model learns an implicit "when in doubt,
+# predict the majority class" prior. This is why ambiguous or
+# low-quality images tend to collapse toward whichever class has
+# the most training data, even when the network is not genuinely
+# confident. Class weighting corrects for this directly during
+# training — it does NOT require collecting any new data.
+# ============================================================
+def compute_class_weights_from_generator(generator):
+    """
+    Computes balanced class weights from a Keras ImageDataGenerator's
+    flow_from_directory output. Returns a dict like {0: 1.4, 1: 0.8, ...}
+    suitable for passing straight into model.fit(class_weight=...).
+    """
+    class_indices = generator.class_indices                 # {'Early_Blight': 0, ...}
+    labels         = generator.classes                       # array of integer labels per sample
+    unique_classes = np.unique(labels)
+
+    weights = compute_class_weight(
+        class_weight='balanced',
+        classes=unique_classes,
+        y=labels,
+    )
+    weight_dict = {int(cls): float(w) for cls, w in zip(unique_classes, weights)}
+
+    print(f"  ⚖️  Class weights (balanced):")
+    idx_to_name = {v: k for k, v in class_indices.items()}
+    for idx, w in sorted(weight_dict.items()):
+        name  = idx_to_name.get(idx, str(idx))
+        count = int(np.sum(labels == idx))
+        print(f"      {name:20s} (n={count:5d}) → weight {w:.3f}")
+
+    return weight_dict
+
+# ============================================================
 # BUILD MODEL — MobileNetV2
 # ============================================================
 def build_model(num_classes):
@@ -274,6 +358,9 @@ def train_crop(crop_name):
     print(f"  ✅ Class map saved: {class_file}")
     print(f"  📋 Map: {idx_to_class}")
 
+    # ---- Class Weighting (fixes majority-class bias) ----
+    class_weights = compute_class_weights_from_generator(train_gen)
+
     # Model
     model, base_model = build_model(num_classes)
     model_path = os.path.join(MODEL_DIR, f"{crop_name}_model.h5")
@@ -307,6 +394,7 @@ def train_crop(crop_name):
         epochs=15,
         validation_data=val_gen,
         callbacks=callbacks,
+        class_weight=class_weights,
         verbose=1,
     )
 
@@ -328,6 +416,7 @@ def train_crop(crop_name):
         initial_epoch=len(history1.history['accuracy']),
         validation_data=val_gen,
         callbacks=callbacks,
+        class_weight=class_weights,
         verbose=1,
     )
 
@@ -337,6 +426,98 @@ def train_crop(crop_name):
     print(f"  ✅ Model saved: {model_path}")
 
     plot_training(history1, history2, crop_name)
+
+# ============================================================
+# TRAIN CROP CLASSIFIER
+# Separate from train_crop() above — this trains the FIRST-stage
+# model that decides which crop an image shows, before any disease
+# model runs. Same pipeline, same class weighting fix applied.
+# ============================================================
+def train_crop_classifier():
+    print(f"\n{'='*55}")
+    print(f"  🔍 Training: Crop Classifier")
+    print(f"{'='*55}")
+
+    crop_path = os.path.join(DATASET_DIR, CROP_CLASSIFIER_FOLDER)
+    if not os.path.exists(crop_path):
+        print(f"  ⚠️  Skipping — folder nahi mila: {crop_path}")
+        print(f"      (Crop classifier training is optional — only runs if this folder exists)")
+        return
+
+    train_gen, val_gen = create_generators_auto(crop_path)
+    if train_gen is None:
+        return
+
+    num_classes   = len(train_gen.class_indices)
+    class_indices = train_gen.class_indices
+
+    print(f"  ✅ Classes found:  {list(class_indices.keys())}")
+    print(f"  ✅ Train images:   {train_gen.samples}")
+    print(f"  ✅ Val images:     {val_gen.samples}")
+    print(f"  ✅ Num classes:    {num_classes}")
+
+    if "Other" not in class_indices:
+        print(f"  ℹ️  No 'Other' class folder found — training {num_classes}-way classifier")
+        print(f"      without explicit out-of-distribution rejection (see config comment above).")
+
+    # Class map: index → display name (identity mapping — folder names
+    # ARE the crop names here, e.g. "Tomato" -> "Tomato")
+    idx_to_class = {str(idx): name for name, idx in class_indices.items()}
+
+    class_file = os.path.join(MODEL_DIR, "crop_classes.json")
+    with open(class_file, 'w') as f:
+        json.dump(idx_to_class, f, indent=2)
+    print(f"  ✅ Class map saved: {class_file}")
+    print(f"  📋 Map: {idx_to_class}")
+
+    # ---- Class Weighting (fixes Tomato-majority bias) ----
+    class_weights = compute_class_weights_from_generator(train_gen)
+
+    model, base_model = build_model(num_classes)
+    model_path = os.path.join(MODEL_DIR, "crop_classifier.h5")
+
+    callbacks = [
+        ModelCheckpoint(model_path, monitor='val_accuracy', save_best_only=True, verbose=1),
+        EarlyStopping(monitor='val_accuracy', patience=8, restore_best_weights=True, verbose=1),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-7, verbose=1),
+    ]
+
+    print(f"\n  📌 Phase 1: Top layers training (base frozen)...")
+    history1 = model.fit(
+        train_gen,
+        epochs=15,
+        validation_data=val_gen,
+        callbacks=callbacks,
+        class_weight=class_weights,
+        verbose=1,
+    )
+
+    print(f"\n  📌 Phase 2: Fine-tuning (last 30 layers)...")
+    base_model.trainable = True
+    for layer in base_model.layers[:-30]:
+        layer.trainable = False
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE / 10),
+        loss='categorical_crossentropy',
+        metrics=['accuracy'],
+    )
+
+    history2 = model.fit(
+        train_gen,
+        epochs=EPOCHS,
+        initial_epoch=len(history1.history['accuracy']),
+        validation_data=val_gen,
+        callbacks=callbacks,
+        class_weight=class_weights,
+        verbose=1,
+    )
+
+    val_loss, val_acc = model.evaluate(val_gen, verbose=0)
+    print(f"\n  🎯 Crop Classifier Final Accuracy: {val_acc*100:.2f}%")
+    print(f"  ✅ Model saved: {model_path}")
+
+    plot_training(history1, history2, "CropClassifier")
 
 # ============================================================
 # MAIN
@@ -367,6 +548,12 @@ if __name__ == "__main__":
 
     print(f"\n🚀 Training shuru: {available}")
     print("="*55)
+
+    # Crop classifier first — this is the model that decides which
+    # crop an image shows, and the one responsible for the
+    # mango/human → Tomato misclassification bug if left untrained
+    # with proper class weighting.
+    train_crop_classifier()
 
     for crop in available:
         train_crop(crop)
